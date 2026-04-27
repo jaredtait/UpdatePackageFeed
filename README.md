@@ -1,56 +1,92 @@
 # UpdatePackageFeed
-Updates npm and NuGet packages feeds
 
-Prompt to Create Automation for Publishing npm Packages
+Automation for updating, validating, and publishing npm and NuGet packages after a CVE is detected in a security audit stage.
 
-Goal: Automate npm package updates after CVEs are discovered, including validating authenticity and managing versions using package.json and yarn.lock.
+## Contents
 
-Prompt:
-Create an Azure DevOps pipeline or script that automates the process of updating npm packages after a CVE is detected in the pipeline security audit stage. The mechanism should:
+- `pipelines/cve-package-update.yml` - Azure DevOps pipeline entry point.
+- `scripts/Invoke-CveNpmUpdate.ps1` - npm/yarn CVE update, signature validation, and feed publish orchestration.
+- `scripts/Publish-NpmFeed.ps1` - npm publish helper for TFS/Azure DevOps feeds.
+- `scripts/Invoke-CveNuGetUpdate.ps1` - NuGet package download/update, signature validation, and feed publish orchestration.
+- `scripts/Publish-NuGetFeed.ps1` - NuGet publish helper for TFS/Azure DevOps feeds.
 
-Triggering & Input:
-Accept a trigger when a CVE is detected (e.g., after security audit).
-Use the package.json and yarn.lock files as input (these will be provided by the developer after CVE detection).
-Package Installation & Validation:
-Clear any temporary directories such as \temp\npmpublish and \temp\yarncache.
-Copy the package.json and yarn.lock files to a specified directory (e.g., \temp\npmpublish).
-Ensure the .npmrc is configured for the public npm registry (i.e., registry=http://registry.npmjs.org/).
-Install dependencies using yarn install or update the package if necessary with yarn add {package@version}.
-Signature Validation:
-Run npm audit signatures to ensure the authenticity of packages before publishing.
-Permissions:
-Remove read-only attributes on files in \temp\yarncache.
-Modify folder permissions in the cache directory (e.g., d:\temp\yarncache\v6).
-Publishing:
-Use a PowerShell script (Publish-NpmFeed.ps1) to publish the package to the TFS Test feed, with a flag to PromoteToRelease=true.
-Publish the same package to the TFS Live feed, ensuring the PromoteToRelease=true flag is set if the package is production-ready.
-Output:
-Ensure logs are generated for each step, especially for validation and publishing.
-Prompt for Codex to Create Automation for Publishing NuGet Packages
+## Pipeline Usage
 
-Goal: Automate NuGet package updates after CVEs are detected, with validation and publishing to private feeds.
+Create secret pipeline variables for feed publishing:
 
-Prompt:
-Create an Azure DevOps pipeline or script that automates the process of updating NuGet packages after a CVE is detected during the security audit stage. The mechanism should:
+- `NPM_PUBLISH_PAT`
+- `NUGET_PUBLISH_PAT`
 
-Triggering & Input:
-Accept a trigger when a CVE is detected (e.g., after security audit).
-Use packages.config for .NET Framework 4.8 and .csproj for .NET 10 apps for package information.
-Package Installation:
-Fetch the latest version of the package from the NuGet public feed (https://api.nuget.org/v3/index.json).
-Use NuGet.exe to install or update the package by specifying the name, version, and target framework (e.g., net481 or net8.0).
-Store the downloaded package in the C:\Temp\DownloadNuGetPackages directory.
-Signature Validation:
-Validate the package signatures using nuget verify -Signatures {packagefile} to ensure authenticity.
-Publishing:
-Use the Publish-NuGetFeed.ps1 script to deploy the package to the TFS Test feed, ensuring that PromoteToRelease=true is set if the package is production-ready.
-Publish the package to the TFS Live feed in the same way, ensuring proper promotion if necessary.
-Output:
-Ensure logs are generated for each step, especially for package installation, signature validation, and publishing.
-General Considerations for Both Prompts
-Security & Authentication:
-Ensure that Personal Access Tokens (PATs) are used securely for authentication when publishing to the Azure DevOps private feeds. This should be set up as part of the pipeline, not manually.
-Version Management:
-Handle versioning automatically based on CVE patches, either incrementing versions or allowing the developer to specify a new version number.
-Auditing:
-Include an audit step after publishing to ensure all packages have been successfully published and that the CVE fix is effective.
+Run `pipelines/cve-package-update.yml` after the security audit detects a CVE. The audit stage can trigger this pipeline manually, through the Azure DevOps REST API, or by using it as a downstream template/stage.
+
+Important pipeline parameters:
+
+- `ecosystem`: `npm`, `nuget`, or `both`.
+- `cveId`: CVE identifier for logging and traceability.
+- `packageName`: package to update.
+- `packageVersion`: patched version. If omitted for NuGet, the latest stable public version is fetched.
+- `productionReady`: passes `PromoteToRelease=true` to publish scripts.
+- `publishToLive`: publishes to the live feed after test feed publishing.
+- `npmInputDirectory`: directory containing `package.json` and `yarn.lock`.
+- `nugetPackageConfigPath`: path to `packages.config` or `.csproj` when package name inference is needed.
+- Feed URL parameters for TFS Test and TFS Live npm/NuGet feeds.
+
+## npm Flow
+
+`Invoke-CveNpmUpdate.ps1` performs these steps:
+
+1. Clears `C:\Temp\npmpublish` and `C:\Temp\yarncache` by default.
+2. Copies `package.json` and `yarn.lock` into the npm staging directory.
+3. Writes `.npmrc` for the public npm registry.
+4. Runs `yarn add package@version` when a package/version is provided, otherwise runs `yarn install --frozen-lockfile`.
+5. Removes read-only attributes under the Yarn cache and grants permissions on the `v6` cache folder when present.
+6. Runs `npm audit signatures`.
+7. Publishes to the TFS Test feed and optionally the TFS Live feed.
+8. Runs a feed lookup after publish and writes logs to the Azure Pipelines artifact staging directory.
+
+Example:
+
+```powershell
+pwsh scripts/Invoke-CveNpmUpdate.ps1 `
+  -PackageJsonPath .\package.json `
+  -YarnLockPath .\yarn.lock `
+  -PackageName lodash `
+  -PackageVersion 4.17.21 `
+  -CveId CVE-2021-23337 `
+  -TestFeedRegistryUrl "https://pkgs.dev.azure.com/org/project/_packaging/test/npm/registry/" `
+  -LiveFeedRegistryUrl "https://pkgs.dev.azure.com/org/project/_packaging/live/npm/registry/" `
+  -PromoteToRelease `
+  -PublishToLive
+```
+
+## NuGet Flow
+
+`Invoke-CveNuGetUpdate.ps1` performs these steps:
+
+1. Accepts `packages.config` for .NET Framework apps or `.csproj` files for SDK-style apps.
+2. Fetches the latest stable version from NuGet.org when `-PackageVersion` is not provided.
+3. Downloads the package into `C:\Temp\DownloadNuGetPackages` by default.
+4. Runs `nuget verify -Signatures`.
+5. Publishes to the TFS Test feed and optionally the TFS Live feed.
+6. Runs a feed lookup after publish and writes logs to the Azure Pipelines artifact staging directory.
+
+Example:
+
+```powershell
+pwsh scripts/Invoke-CveNuGetUpdate.ps1 `
+  -PackageConfigPath .\packages.config `
+  -PackageName Newtonsoft.Json `
+  -PackageVersion 13.0.3 `
+  -TargetFramework net481 `
+  -TestFeedSourceUrl "https://pkgs.dev.azure.com/org/project/_packaging/test/nuget/v3/index.json" `
+  -LiveFeedSourceUrl "https://pkgs.dev.azure.com/org/project/_packaging/live/nuget/v3/index.json" `
+  -PromoteToRelease `
+  -PublishToLive
+```
+
+## Security Notes
+
+- Store PATs as secret pipeline variables only. Do not commit them to the repository.
+- The scripts map PATs through `NPM_PUBLISH_TOKEN` and `NUGET_PUBLISH_TOKEN`.
+- Package authenticity is checked with `npm audit signatures` and `nuget verify -Signatures` before publishing.
+- Live publishing is opt-in through `publishToLive`.
