@@ -46,35 +46,85 @@ function Invoke-LoggedCommand {
     }
 }
 
-function Resolve-PackageName {
+function Resolve-NuGetPackageRequests {
     param([string]$ConfigPath)
 
     if ($PackageName) {
-        return $PackageName
+        $resolvedVersion = $PackageVersion
+        if (-not $resolvedVersion) {
+            $resolvedVersion = Resolve-LatestVersion -Name $PackageName
+        }
+
+        return @([pscustomobject]@{
+            Name = $PackageName
+            Version = $resolvedVersion
+            TargetFramework = $TargetFramework
+        })
     }
 
     if (-not $ConfigPath) {
-        throw 'PackageName was not provided and PackageConfigPath is empty.'
+        throw 'Provide either PackageName and optional PackageVersion, or PackageConfigPath.'
     }
 
     if (-not (Test-Path -LiteralPath $ConfigPath -PathType Leaf)) {
         throw "Package config was not found at $ConfigPath"
     }
 
+    $requests = @()
     [xml]$xml = Get-Content -LiteralPath $ConfigPath
     if ($ConfigPath.EndsWith('packages.config', [StringComparison]::OrdinalIgnoreCase)) {
-        $firstPackage = $xml.SelectSingleNode('//*[local-name()="package"]')
-        if ($firstPackage -and $firstPackage.Attributes['id']) {
-            return [string]$firstPackage.Attributes['id'].Value
+        $packageNodes = @($xml.SelectNodes('//*[local-name()="package"]'))
+        foreach ($packageNode in $packageNodes) {
+            if (-not $packageNode.Attributes['id']) {
+                continue
+            }
+
+            $name = [string]$packageNode.Attributes['id'].Value
+            $version = if ($packageNode.Attributes['version']) { [string]$packageNode.Attributes['version'].Value } else { Resolve-LatestVersion -Name $name }
+            $framework = if ($packageNode.Attributes['targetFramework']) { [string]$packageNode.Attributes['targetFramework'].Value } else { $TargetFramework }
+            $requests += [pscustomobject]@{
+                Name = $name
+                Version = $version
+                TargetFramework = $framework
+            }
+        }
+    }
+    else {
+        $packageReferenceNodes = @($xml.SelectNodes('//*[local-name()="PackageReference"]'))
+        foreach ($packageReference in $packageReferenceNodes) {
+            if (-not $packageReference.Attributes['Include']) {
+                continue
+            }
+
+            $name = [string]$packageReference.Attributes['Include'].Value
+            $version = ''
+            if ($packageReference.Attributes['Version']) {
+                $version = [string]$packageReference.Attributes['Version'].Value
+            }
+            else {
+                $versionNode = $packageReference.SelectSingleNode('*[local-name()="Version"]')
+                if ($versionNode) {
+                    $version = [string]$versionNode.InnerText
+                }
+            }
+
+            if (-not $version) {
+                $version = Resolve-LatestVersion -Name $name
+            }
+
+            $requests += [pscustomobject]@{
+                Name = $name
+                Version = $version
+                TargetFramework = $TargetFramework
+            }
         }
     }
 
-    $packageReference = $xml.SelectSingleNode('//*[local-name()="PackageReference"]')
-    if ($packageReference -and $packageReference.Attributes['Include']) {
-        return [string]$packageReference.Attributes['Include'].Value
+    if ($requests.Count -gt 0) {
+        return $requests
     }
 
-    throw "Could not infer a package name from $ConfigPath. Pass -PackageName explicitly."
+    throw "No NuGet packages were found in $ConfigPath. Pass -PackageName explicitly."
 }
 
 function Resolve-LatestVersion {
@@ -93,11 +143,6 @@ function Resolve-LatestVersion {
     return [string]$stableVersions[-1]
 }
 
-$resolvedPackageName = Resolve-PackageName -ConfigPath $PackageConfigPath
-if (-not $PackageVersion) {
-    $PackageVersion = Resolve-LatestVersion -Name $resolvedPackageName
-}
-
 $artifactDirectory = if ($env:BUILD_ARTIFACTSTAGINGDIRECTORY) { $env:BUILD_ARTIFACTSTAGINGDIRECTORY } else { Join-Path ([IO.Path]::GetTempPath()) 'UpdatePackageFeedLogs' }
 New-Item -ItemType Directory -Path $artifactDirectory -Force | Out-Null
 $logPath = Join-Path $artifactDirectory ("nuget-cve-update-{0}.log" -f (Get-Date -Format 'yyyyMMdd-HHmmss'))
@@ -105,57 +150,62 @@ $logPath = Join-Path $artifactDirectory ("nuget-cve-update-{0}.log" -f (Get-Date
 Start-Transcript -Path $logPath -Force | Out-Null
 try {
     Write-Step "Starting NuGet CVE update workflow. CVE: $CveId"
+    $packageRequests = @(Resolve-NuGetPackageRequests -ConfigPath $PackageConfigPath)
+    Write-Step ("Resolved {0} NuGet package request(s)." -f $packageRequests.Count)
 
     if (Test-Path -LiteralPath $DownloadDirectory) {
         Remove-Item -LiteralPath $DownloadDirectory -Recurse -Force
     }
     New-Item -ItemType Directory -Path $DownloadDirectory -Force | Out-Null
 
-    Invoke-LoggedCommand -FilePath $NuGetExePath -Arguments @(
-        'install', $resolvedPackageName,
-        '-Version', $PackageVersion,
-        '-OutputDirectory', $DownloadDirectory,
-        '-Source', $PublicNuGetSource,
-        '-Framework', $TargetFramework,
-        '-DirectDownload',
-        '-NonInteractive',
-        '-Verbosity', 'detailed'
-    ) -WorkingDirectory $DownloadDirectory
-
-    $packageFile = Get-ChildItem -Path $DownloadDirectory -Filter "$resolvedPackageName.$PackageVersion.nupkg" -Recurse |
-        Where-Object { $_.Name -notlike '*.symbols.nupkg' } |
-        Select-Object -First 1
-
-    if (-not $packageFile) {
-        throw "Downloaded package file was not found for $resolvedPackageName $PackageVersion."
-    }
-
-    Invoke-LoggedCommand -FilePath $NuGetExePath -Arguments @('verify', $packageFile.FullName, '-Signatures', '-NonInteractive') -WorkingDirectory $DownloadDirectory
-
     if (-not (Test-Path -LiteralPath $PublishScriptPath -PathType Leaf)) {
         throw "Publish script was not found at $PublishScriptPath"
     }
 
-    if ($TestFeedSourceUrl) {
-        & $PublishScriptPath `
-            -PackageFilePath $packageFile.FullName `
-            -FeedSourceUrl $TestFeedSourceUrl `
-            -FeedName 'TFS Test' `
-            -PromoteToRelease:$PromoteToRelease
-    }
-    else {
-        Write-Step 'Skipping TFS Test publish because TestFeedSourceUrl was not provided.'
-    }
+    foreach ($request in $packageRequests) {
+        Write-Step "Processing NuGet package $($request.Name) $($request.Version)"
+        Invoke-LoggedCommand -FilePath $NuGetExePath -Arguments @(
+            'install', $request.Name,
+            '-Version', $request.Version,
+            '-OutputDirectory', $DownloadDirectory,
+            '-Source', $PublicNuGetSource,
+            '-Framework', $request.TargetFramework,
+            '-DirectDownload',
+            '-NonInteractive',
+            '-Verbosity', 'detailed'
+        ) -WorkingDirectory $DownloadDirectory
 
-    if ($PublishToLive -and $LiveFeedSourceUrl) {
-        & $PublishScriptPath `
-            -PackageFilePath $packageFile.FullName `
-            -FeedSourceUrl $LiveFeedSourceUrl `
-            -FeedName 'TFS Live' `
-            -PromoteToRelease:$PromoteToRelease
-    }
-    elseif ($PublishToLive) {
-        throw 'PublishToLive was set, but LiveFeedSourceUrl was not provided.'
+        $packageFile = Get-ChildItem -Path $DownloadDirectory -Filter "$($request.Name).$($request.Version).nupkg" -Recurse |
+            Where-Object { $_.Name -notlike '*.symbols.nupkg' } |
+            Select-Object -First 1
+
+        if (-not $packageFile) {
+            throw "Downloaded package file was not found for $($request.Name) $($request.Version)."
+        }
+
+        Invoke-LoggedCommand -FilePath $NuGetExePath -Arguments @('verify', $packageFile.FullName, '-Signatures', '-NonInteractive') -WorkingDirectory $DownloadDirectory
+
+        if ($TestFeedSourceUrl) {
+            & $PublishScriptPath `
+                -PackageFilePath $packageFile.FullName `
+                -FeedSourceUrl $TestFeedSourceUrl `
+                -FeedName 'TFS Test' `
+                -PromoteToRelease:$PromoteToRelease
+        }
+        else {
+            Write-Step 'Skipping TFS Test publish because TestFeedSourceUrl was not provided.'
+        }
+
+        if ($PublishToLive -and $LiveFeedSourceUrl) {
+            & $PublishScriptPath `
+                -PackageFilePath $packageFile.FullName `
+                -FeedSourceUrl $LiveFeedSourceUrl `
+                -FeedName 'TFS Live' `
+                -PromoteToRelease:$PromoteToRelease
+        }
+        elseif ($PublishToLive) {
+            throw 'PublishToLive was set, but LiveFeedSourceUrl was not provided.'
+        }
     }
 
     Write-Step "NuGet CVE update workflow completed. Log: $logPath"

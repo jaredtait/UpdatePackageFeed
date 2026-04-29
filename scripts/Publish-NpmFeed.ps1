@@ -1,7 +1,8 @@
 [CmdletBinding()]
 param(
-    [Parameter(Mandatory)]
-    [string]$PackageDirectory,
+    [string]$PackageDirectory = '',
+    [string]$PackageTarballPath = '',
+    [string]$PackageSpec = '',
 
     [Parameter(Mandatory)]
     [string]$FeedRegistryUrl,
@@ -40,17 +41,27 @@ function Invoke-LoggedCommand {
     }
 }
 
-if (-not (Test-Path -LiteralPath $PackageDirectory -PathType Container)) {
+if ($PackageDirectory -and -not (Test-Path -LiteralPath $PackageDirectory -PathType Container)) {
     throw "Package directory was not found at $PackageDirectory"
+}
+
+if (-not $PackageDirectory -and -not $PackageTarballPath) {
+    throw 'Provide either PackageDirectory or PackageTarballPath.'
+}
+
+if ($PackageTarballPath -and -not (Test-Path -LiteralPath $PackageTarballPath -PathType Leaf)) {
+    throw "Package tarball was not found at $PackageTarballPath"
 }
 
 if (-not $Token) {
     throw 'NPM_PUBLISH_TOKEN was not provided. Store the PAT as a secret pipeline variable and map it to this environment variable.'
 }
 
+$publishPath = if ($PackageTarballPath) { $PackageTarballPath } else { $PackageDirectory }
+$authDirectory = if ($PackageTarballPath) { Split-Path -Parent $PackageTarballPath } else { $PackageDirectory }
 $registryUri = [Uri]$FeedRegistryUrl
 $registryPath = $registryUri.AbsoluteUri -replace '^https?:', ''
-$npmrcPath = Join-Path $PackageDirectory '.npmrc'
+$npmrcPath = Join-Path $authDirectory '.npmrc'
 
 Add-Content -Path $npmrcPath -Value @(
     "registry=$FeedRegistryUrl"
@@ -58,13 +69,23 @@ Add-Content -Path $npmrcPath -Value @(
     "$registryPath`:_authToken=$Token"
 ) -Encoding ascii
 
-Write-Step "Publishing package in $PackageDirectory to $FeedName"
-Invoke-LoggedCommand -FilePath 'npm.cmd' -Arguments @('publish', '--registry', $FeedRegistryUrl) -WorkingDirectory $PackageDirectory
+Write-Step "Publishing $publishPath to $FeedName"
+if ($PackageTarballPath) {
+    Invoke-LoggedCommand -FilePath 'npm.cmd' -Arguments @('publish', $PackageTarballPath, '--registry', $FeedRegistryUrl) -WorkingDirectory $authDirectory
+}
+else {
+    Invoke-LoggedCommand -FilePath 'npm.cmd' -Arguments @('publish', '--registry', $FeedRegistryUrl) -WorkingDirectory $PackageDirectory
+}
 
 if ($PromoteToRelease) {
     Write-Step "PromoteToRelease=true for $FeedName. Configure feed views or release promotion policy in Azure DevOps/TFS for this registry."
 }
 
-$packageJson = Get-Content -LiteralPath (Join-Path $PackageDirectory 'package.json') -Raw | ConvertFrom-Json
-$packageSpec = "$($packageJson.name)@$($packageJson.version)"
-Invoke-LoggedCommand -FilePath 'npm.cmd' -Arguments @('view', $packageSpec, 'version', '--registry', $FeedRegistryUrl) -WorkingDirectory $PackageDirectory
+if (-not $PackageSpec -and $PackageDirectory) {
+    $packageJson = Get-Content -LiteralPath (Join-Path $PackageDirectory 'package.json') -Raw | ConvertFrom-Json
+    $PackageSpec = "$($packageJson.name)@$($packageJson.version)"
+}
+
+if ($PackageSpec) {
+    Invoke-LoggedCommand -FilePath 'npm.cmd' -Arguments @('view', $PackageSpec, 'version', '--registry', $FeedRegistryUrl) -WorkingDirectory $authDirectory
+}
